@@ -1,0 +1,141 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [master]
+
+  push:
+    branches: [develop, master]
+    paths:
+      - 'index.html'
+      - 'Dockerfile'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/nginx-static
+
+jobs:
+  # Corre en cada PR hacia master: valida que la imagen buildea y el contenedor levanta
+  ci:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: nginx-static:test
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Actualizar cache (evita crecimiento indefinido)
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Smoke test
+        run: |
+          docker run -d --name test-nginx -p 8080:80 nginx-static:test
+          sleep 2
+          curl -f http://localhost:8080 || (docker logs test-nginx && exit 1)
+          docker stop test-nginx
+
+  # Corre en cada push a develop o master: construye y publica la imagen en ECR
+  # El build reutiliza la caché de capas del job ci del PR, siendo más rápido
+  build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/nginx-static-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ECR_IMAGE }}:${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Actualizar cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # Corre luego de build si el push fue a develop: despliega en ECS dev
+  deploy-dev:
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/nginx-static-github-actions-dev
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull image
+        run: docker pull ${{ env.ECR_IMAGE }}:${{ github.sha }}
+
+      - name: Deploy to ECS dev
+        run: |
+          aws ecs update-service \
+            --cluster nginx-static-dev \
+            --service nginx-static-svc \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+  # Corre luego de build si el push fue a master: despliega en ECS prod
+  deploy-prod:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/nginx-static-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull image
+        run: docker pull ${{ env.ECR_IMAGE }}:${{ github.sha }}
+
+      - name: Deploy to ECS prod
+        run: |
+          aws ecs update-service \
+            --cluster nginx-static \
+            --service nginx-static-svc \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
